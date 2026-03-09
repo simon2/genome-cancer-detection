@@ -28,14 +28,12 @@ def read_data(filepath):
 
 
 tumor, normal = read_data('data/BLCA.txt')
-# normal = 1 - normal
 print(f"Tumor matrix shape:     {tumor.shape}")
 print(f"Non-tumor matrix shape: {normal.shape}")
 
 iteration = 0
 total_start = time.time()
 while tumor.shape[1] > 0:
-    # iter_start = time.time()
     iteration += 1
     print(f"\n=== Iteration {iteration} ===")
     print(f"Tumor matrix shape: {tumor.shape}")
@@ -45,16 +43,11 @@ while tumor.shape[1] > 0:
     tumor_t_gpu = cp.asarray(tumor_t, dtype=cp.int16)
     mtx_2h_tumor = cp.asnumpy(tumor_gpu @ tumor_t_gpu)
 
-    normal_t = normal.T
     normal_gpu = cp.asarray(normal, dtype=cp.int16)
-    normal_t_gpu = cp.asarray(normal_t, dtype=cp.int16)
-    mtx_2h_normal = cp.asnumpy(normal_gpu @ normal_t_gpu)
-
-    mtx_2h = mtx_2h_tumor + (10 * (normal.shape[1] - mtx_2h_normal))
 
     # Extract upper triangle (i < j)
-    i_idx, j_idx = np.triu_indices(mtx_2h.shape[0], k=1)
-    upper_vals = mtx_2h[i_idx, j_idx]
+    i_idx, j_idx = np.triu_indices(mtx_2h_tumor.shape[0], k=1)
+    upper_vals = mtx_2h_tumor[i_idx, j_idx]
 
     # Sort by value descending, take top 10000
     sort_order_2h = np.argsort(upper_vals)[::-1]
@@ -63,8 +56,8 @@ while tumor.shape[1] > 0:
 
     print(f"max value of 2 hit is {sorted_vals_2h[0]}")
 
-    top_10k = sorted_indices[:10000]
-    boundary_2h = sorted_vals_2h[10000]
+    top_10k = sorted_indices[:25000]
+    boundary_2h = sorted_vals_2h[25000]
 
     top_i = cp.asarray(top_10k[:, 0])
     top_j = cp.asarray(top_10k[:, 1])
@@ -72,11 +65,12 @@ while tumor.shape[1] > 0:
     # For each pair (i,j) and each tumor k: tumor[i,k] & tumor[j,k] -> (10000, 309)
     mtx_10k_tumor = tumor_gpu[top_i] * tumor_gpu[top_j]
     mtx_10k_normal = normal_gpu[top_i] * normal_gpu[top_j]
+    print(mtx_10k_normal.shape)
 
     # (10000, 309) @ (309, 10000) -> (10000, 10000)
     mtx_4h_tumor = mtx_10k_tumor @ mtx_10k_tumor.T
     mtx_4h_normal = mtx_10k_normal @ mtx_10k_normal.T
-    mtx_4h = mtx_4h_tumor + (10 * (normal.shape[1] - mtx_4h_normal))
+    mtx_4h = mtx_4h_tumor - (10 * mtx_4h_normal)
     ri, rj = cp.triu_indices(mtx_4h.shape[0], k=1)
     upper_4h = mtx_4h[ri, rj]
 
@@ -105,17 +99,12 @@ while tumor.shape[1] > 0:
         idx_a, idx_b = top_10k[max_idx[0]]
         idx_c, idx_d = top_10k[max_idx[1]]
         mask_tumor = (tumor[idx_a] & tumor[idx_b] & tumor[idx_c] & tumor[idx_d]).astype(bool)
-        mask_normal = (normal[idx_a] & normal[idx_b] & normal[idx_c] & normal[idx_d]).astype(bool)
-        print(f"Removing {np.sum(mask_tumor)} tumors and {np.sum(mask_normal)} normals where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
+        print(f"Removing {np.sum(mask_tumor)} tumors where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
         tumor = tumor[:, ~mask_tumor]
-        normal = normal[:, ~mask_normal]
-        # non_tumor = non_tumor[:, ~mask]
+        
     else:
         print(f"max_val ({max_val_cpu}) < boundary_2h ({boundary_2h}), stopping.")
-        # print(f"Iteration time: {time.time() - iter_start:.2f}s")
         break
-
-    # print(f"Iteration time: {time.time() - iter_start:.2f}s")
 
 print(f"\nFinal tumor matrix shape: {tumor.shape}")
 print(f"Total loop time: {time.time() - total_start:.2f}s")
