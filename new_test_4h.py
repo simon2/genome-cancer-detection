@@ -69,33 +69,32 @@ def find_best_valid_4h(mtx_4h, chunk_a_indices, chunk_b_indices, cross):
     return (max_val, gene_a, gene_b, gene_c, gene_d)
 
 
-tumor, normal = read_data('data/HNSC.txt')
+tumor, normal = read_data('data/BLCA.txt')
 print(f"Tumor matrix shape:     {tumor.shape}")
 print(f"Non-tumor matrix shape: {normal.shape}")
 
 top_k = 10000
 iteration = 0
 total_start = time.time()
-while tumor.shape[1] > 0:
+
+tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
+normal_gpu = cp.asarray(normal, dtype=cp.int16)
+
+while tumor_gpu.shape[1] > 0:
     iteration += 1
     print(f"\n=== Iteration {iteration} ===")
-    print(f"Tumor matrix shape: {tumor.shape}")
+    print(f"Tumor matrix shape: {tumor_gpu.shape}")
 
-    tumor_t = tumor.T
-    tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
-    tumor_t_gpu = cp.asarray(tumor_t, dtype=cp.int16)
-    mtx_2h_tumor = cp.asnumpy(tumor_gpu @ tumor_t_gpu)
-
-    normal_gpu = cp.asarray(normal, dtype=cp.int16)
+    mtx_2h_tumor = tumor_gpu @ tumor_gpu.T
 
     # Extract upper triangle (i < j)
-    i_idx, j_idx = np.triu_indices(mtx_2h_tumor.shape[0], k=1)
+    i_idx, j_idx = cp.triu_indices(mtx_2h_tumor.shape[0], k=1) # TODO: cp.triu_indices
     upper_vals = mtx_2h_tumor[i_idx, j_idx]
 
     # Sort by value descending
-    sort_order_2h = np.argsort(upper_vals)[::-1]
+    sort_order_2h = cp.argsort(upper_vals)[::-1] # TODO: cp.argsort
     sorted_vals_2h = upper_vals[sort_order_2h]
-    sorted_indices = np.stack([i_idx[sort_order_2h], j_idx[sort_order_2h]], axis=1)
+    sorted_indices = cp.stack([i_idx[sort_order_2h], j_idx[sort_order_2h]], axis=1)
 
     print(f"max value of 2 hit is {sorted_vals_2h[0]}")
 
@@ -161,13 +160,13 @@ while tumor.shape[1] > 0:
 
     if best_genes is not None:
         idx_a, idx_b, idx_c, idx_d = best_genes
-        mask_tumor = (tumor[idx_a] & tumor[idx_b] & tumor[idx_c] & tumor[idx_d]).astype(bool)
+        mask_tumor = (tumor_gpu[idx_a] & tumor_gpu[idx_b] & tumor_gpu[idx_c] & tumor_gpu[idx_d]).astype(bool)
         removed = np.sum(mask_tumor)
         if removed == 0:
             print(f"No tumors removed with genes {idx_a},{idx_b},{idx_c},{idx_d}, stopping.")
             break
         print(f"Removing {removed} tumors where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
-        tumor = tumor[:, ~mask_tumor]
+        tumor_gpu = tumor_gpu[:, ~mask_tumor]
     else:
         print("No valid 4-hit combination found, stopping.")
         break
