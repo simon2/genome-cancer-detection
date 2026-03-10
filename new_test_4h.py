@@ -69,12 +69,24 @@ def find_best_valid_4h(mtx_4h, chunk_a_indices, chunk_b_indices, cross):
     return (max_val, gene_a, gene_b, gene_c, gene_d)
 
 
-tumor, normal = read_data('data/BLCA.txt')
+tumor, normal = read_data('data/LGG.txt')
 print(f"Tumor matrix shape:     {tumor.shape}")
 print(f"Non-tumor matrix shape: {normal.shape}")
 
+def print_results(results):
+    print("\n=== Summary ===")
+    for r in results:
+        print(f"Iter {r['iter']}: genes ({r['genes'][0]},{r['genes'][1]},{r['genes'][2]},{r['genes'][3]})  "
+              f"score={r['score']}  removed={r['removed']}  normals_covered={r['normals_covered']}")
+
+def print_result_genes(results):
+    print("\n=== Summary ===")
+    for r in results:
+        print(f"{r['genes'][0]},{r['genes'][1]},{r['genes'][2]},{r['genes'][3]}")
+
 top_k = 10000
 iteration = 0
+results = []
 total_start = time.time()
 
 tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
@@ -161,15 +173,25 @@ while tumor_gpu.shape[1] > 0:
     if best_genes is not None:
         idx_a, idx_b, idx_c, idx_d = best_genes
         mask_tumor = (tumor_gpu[idx_a] & tumor_gpu[idx_b] & tumor_gpu[idx_c] & tumor_gpu[idx_d]).astype(bool)
-        removed = np.sum(mask_tumor)
+        removed = cp.sum(mask_tumor)
+        mask_normal = (normal_gpu[idx_a] & normal_gpu[idx_b] & normal_gpu[idx_c] & normal_gpu[idx_d]).astype(bool)
+        covered = cp.sum(mask_normal)
         if removed == 0:
             print(f"No tumors removed with genes {idx_a},{idx_b},{idx_c},{idx_d}, stopping.")
             break
-        print(f"Removing {removed} tumors where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
+        print(f"Removing {removed} tumors ({covered} normals are covered) where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
+        results.append({
+            'iter': iteration,
+            'genes': [int(idx_a), int(idx_b), int(idx_c), int(idx_d)],
+            'score': best_val,
+            'removed': int(removed),
+            'normals_covered': int(covered),
+        })
         tumor_gpu = tumor_gpu[:, ~mask_tumor]
     else:
         print("No valid 4-hit combination found, stopping.")
         break
 
-print(f"\nFinal tumor matrix shape: {tumor.shape}")
+print(f"\nFinal tumor matrix shape: {tumor_gpu.shape}")
 print(f"Total loop time: {time.time() - total_start:.2f}s")
+print_result_genes(results)
