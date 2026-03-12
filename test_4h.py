@@ -11,9 +11,6 @@ def read_data(filepath):
         # header[2] is ignored
         n_tumor = int(header[3])
         n_non_tumor = int(header[4])
-        # assert n_tumor + n_non_tumor == cols, (
-        #     f"tumor ({n_tumor}) + non_tumor ({n_non_tumor}) != cols ({cols})"
-        # )
 
         tumor_matrix = np.empty((rows, n_tumor), dtype=np.uint8)
         non_tumor_matrix = np.empty((rows, n_non_tumor), dtype=np.uint8)
@@ -27,84 +24,162 @@ def read_data(filepath):
     return tumor_matrix, non_tumor_matrix
 
 
+def find_best_valid_4h(mtx_4h, chunk_a_indices, chunk_b_indices, cross):
+    """Find best valid 4-hit combo from score matrix.
+    mtx_4h: (n_a, n_b) score matrix on GPU
+    chunk_a_indices: (n_a, 2) gene indices on GPU (row side)
+    chunk_b_indices: (n_b, 2) gene indices on GPU (col side)
+    cross: if False, matrix is symmetric -> upper triangle only
+    Returns (max_val, g1, g2, g3, g4) or None.
+    """
+    n_a, n_b = mtx_4h.shape
+
+    # Check 4 distinct genes via broadcasting (2 from row × 2 from col)
+    overlap = cp.zeros((n_a, n_b), dtype=bool)
+    for k in range(2):
+        for l in range(2):
+            overlap |= (chunk_a_indices[:, k:k+1] == chunk_b_indices[None, :, l])
+    valid = ~overlap
+
+    if not cross:
+        valid = cp.triu(valid, k=1)
+
+    if not cp.any(valid):
+        return None
+
+    mtx_masked = cp.where(valid, mtx_4h, cp.iinfo(mtx_4h.dtype).min)
+    flat_idx = int(cp.argmax(mtx_masked))
+    p = flat_idx // n_b
+    q = flat_idx % n_b
+    max_val = int(mtx_4h[p, q])
+
+    genes_out = list(cp.asnumpy(chunk_a_indices[p])) + list(cp.asnumpy(chunk_b_indices[q]))
+    return (max_val, *genes_out)
+
+
 tumor, normal = read_data('data/BLCA.txt')
 print(f"Tumor matrix shape:     {tumor.shape}")
 print(f"Non-tumor matrix shape: {normal.shape}")
 
+def print_results(results):
+    print("\n=== Summary ===")
+    for r in results:
+        print(f"Iter {r['iter']}: genes ({r['genes'][0]},{r['genes'][1]},{r['genes'][2]},{r['genes'][3]})  "
+              f"score={r['score']}  removed={r['removed']}  normals_covered={r['normals_covered']}")
+
+def print_result_genes(results):
+    print("\n=== Genes ===")
+    for r in results:
+        print(f"{r['genes'][0]},{r['genes'][1]},{r['genes'][2]},{r['genes'][3]}")
+
+top_k = 10000
 iteration = 0
+results = []
 total_start = time.time()
-while tumor.shape[1] > 0:
+
+tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
+normal_gpu = cp.asarray(normal, dtype=cp.int16)
+
+while tumor_gpu.shape[1] > 0:
     iteration += 1
     print(f"\n=== Iteration {iteration} ===")
-    print(f"Tumor matrix shape: {tumor.shape}")
+    print(f"Tumor matrix shape: {tumor_gpu.shape}")
 
-    tumor_t = tumor.T
-    tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
-    tumor_t_gpu = cp.asarray(tumor_t, dtype=cp.int16)
-    mtx_2h_tumor = cp.asnumpy(tumor_gpu @ tumor_t_gpu)
-
-    normal_gpu = cp.asarray(normal, dtype=cp.int16)
+    mtx_2h_tumor = tumor_gpu @ tumor_gpu.T
 
     # Extract upper triangle (i < j)
-    i_idx, j_idx = np.triu_indices(mtx_2h_tumor.shape[0], k=1)
+    i_idx, j_idx = cp.triu_indices(mtx_2h_tumor.shape[0], k=1) # TODO: cp.triu_indices
     upper_vals = mtx_2h_tumor[i_idx, j_idx]
 
-    # Sort by value descending, take top 10000
-    sort_order_2h = np.argsort(upper_vals)[::-1]
+    # Sort by value descending
+    sort_order_2h = cp.argsort(upper_vals)[::-1] # TODO: cp.argsort
     sorted_vals_2h = upper_vals[sort_order_2h]
-    sorted_indices = np.stack([i_idx[sort_order_2h], j_idx[sort_order_2h]], axis=1)
+    sorted_indices = cp.stack([i_idx[sort_order_2h], j_idx[sort_order_2h]], axis=1)
 
     print(f"max value of 2 hit is {sorted_vals_2h[0]}")
 
-    top_10k = sorted_indices[:25000]
-    boundary_2h = sorted_vals_2h[25000]
+    total_pairs = len(sorted_vals_2h)
+    best_val = None
+    best_genes = None
 
-    top_i = cp.asarray(top_10k[:, 0])
-    top_j = cp.asarray(top_10k[:, 1])
+    # Store chunk data for cross-chunk computation
+    chunk_tumor_list = []
+    chunk_normal_list = []
+    chunk_indices_list = []
 
-    # For each pair (i,j) and each tumor k: tumor[i,k] & tumor[j,k] -> (10000, 309)
-    mtx_10k_tumor = tumor_gpu[top_i] * tumor_gpu[top_j]
-    mtx_10k_normal = normal_gpu[top_i] * normal_gpu[top_j]
-    print(mtx_10k_normal.shape)
+    n_chunk = 0
+    while True:
+        chunk_start = n_chunk * top_k
+        chunk_end = min((n_chunk + 1) * top_k, total_pairs)
 
-    # (10000, 309) @ (309, 10000) -> (10000, 10000)
-    mtx_4h_tumor = mtx_10k_tumor @ mtx_10k_tumor.T
-    mtx_4h_normal = mtx_10k_normal @ mtx_10k_normal.T
-    mtx_4h = mtx_4h_tumor - (10 * mtx_4h_normal)
-    ri, rj = cp.triu_indices(mtx_4h.shape[0], k=1)
-    upper_4h = mtx_4h[ri, rj]
+        if chunk_start >= total_pairs:
+            print("2-hit table exhausted.")
+            break
 
-    # Filter out entries where a,b,c,d are not 4 distinct original indices
-    top_10k_gpu = cp.asarray(top_10k)
-    vals = cp.stack([
-        top_10k_gpu[ri, 0], top_10k_gpu[ri, 1],
-        top_10k_gpu[rj, 0], top_10k_gpu[rj, 1],
-    ], axis=1)
-    vals_sorted = cp.sort(vals, axis=1)
-    valid = cp.all(cp.diff(vals_sorted, axis=1) != 0, axis=1)
+        boundary_2h = sorted_vals_2h[chunk_end] if chunk_end < total_pairs else 0
 
-    valid_vals = upper_4h[valid]
-    valid_positions = cp.where(valid)[0]
-    max_valid_flat = cp.argmax(valid_vals)
-    orig_idx = valid_positions[max_valid_flat]
-    max_val = valid_vals[max_valid_flat]
-    max_idx = (int(ri[orig_idx]), int(rj[orig_idx]))
-    print(f"Max value (no redundants): {max_val}")
-    print(f"Original indices: {top_10k[max_idx[0]]} {top_10k[max_idx[1]]}")
+        # Get current chunk's pairs
+        chunk_indices = sorted_indices[chunk_start:chunk_end]
+        chunk_i = chunk_indices[:, 0]
+        chunk_j = chunk_indices[:, 1]
 
-    max_val_cpu = int(max_val)
+        # Build 2-hit masks for current chunk
+        chunk_tumor = tumor_gpu[chunk_i] * tumor_gpu[chunk_j]
+        chunk_normal = normal_gpu[chunk_i] * normal_gpu[chunk_j]
 
-    if max_val_cpu >= boundary_2h:
-        print(f"max_val ({max_val_cpu}) >= boundary_2h ({boundary_2h}), pruning samples...")
-        idx_a, idx_b = top_10k[max_idx[0]]
-        idx_c, idx_d = top_10k[max_idx[1]]
-        mask_tumor = (tumor[idx_a] & tumor[idx_b] & tumor[idx_c] & tumor[idx_d]).astype(bool)
-        print(f"Removing {np.sum(mask_tumor)} tumors where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
-        tumor = tumor[:, ~mask_tumor]
-        
+        chunk_tumor_list.append(chunk_tumor)
+        chunk_normal_list.append(chunk_normal)
+        chunk_indices_list.append(chunk_indices)
+
+        # Compute new chunk × new chunk (upper triangle)
+        mtx_4h_tumor_nn = chunk_tumor @ chunk_tumor.T
+        mtx_4h_normal_nn = chunk_normal @ chunk_normal.T
+        mtx_4h_nn = mtx_4h_tumor_nn - (10 * mtx_4h_normal_nn)
+
+        result = find_best_valid_4h(mtx_4h_nn, chunk_indices, chunk_indices, cross=False)
+        if result and (best_val is None or result[0] > best_val):
+            best_val, *best_genes = result
+
+        # Compute cross terms: previous chunks × new chunk
+        for prev_idx in range(n_chunk):
+            mtx_4h_tumor_cross = chunk_tumor_list[prev_idx] @ chunk_tumor.T
+            mtx_4h_normal_cross = chunk_normal_list[prev_idx] @ chunk_normal.T
+            mtx_4h_cross = mtx_4h_tumor_cross - (10 * mtx_4h_normal_cross)
+
+            result = find_best_valid_4h(mtx_4h_cross, chunk_indices_list[prev_idx], chunk_indices, cross=True)
+            if result and (best_val is None or result[0] > best_val):
+                best_val, *best_genes = result
+
+        print(f"  Chunk {n_chunk}: pairs [{chunk_start}:{chunk_end}], boundary_2h={boundary_2h}, best_val={best_val}")
+
+        if best_val is not None and best_val >= boundary_2h:
+            print(f"  best_val ({best_val}) >= boundary_2h ({boundary_2h}), search complete.")
+            break
+
+        n_chunk += 1
+
+    if best_genes is not None:
+        idx_a, idx_b, idx_c, idx_d = best_genes
+        mask_tumor = (tumor_gpu[idx_a] & tumor_gpu[idx_b] & tumor_gpu[idx_c] & tumor_gpu[idx_d]).astype(bool)
+        removed = cp.sum(mask_tumor)
+        mask_normal = (normal_gpu[idx_a] & normal_gpu[idx_b] & normal_gpu[idx_c] & normal_gpu[idx_d]).astype(bool)
+        covered = cp.sum(mask_normal)
+        if removed == 0:
+            print(f"No tumors removed with genes {idx_a},{idx_b},{idx_c},{idx_d}, stopping.")
+            break
+        print(f"Removing {removed} tumors ({covered} normals are covered) where indices {idx_a},{idx_b},{idx_c},{idx_d} are all 1")
+        results.append({
+            'iter': iteration,
+            'genes': [int(idx_a), int(idx_b), int(idx_c), int(idx_d)],
+            'score': best_val,
+            'removed': int(removed),
+            'normals_covered': int(covered),
+        })
+        tumor_gpu = tumor_gpu[:, ~mask_tumor]
     else:
-        print(f"max_val ({max_val_cpu}) < boundary_2h ({boundary_2h}), stopping.")
+        print("No valid 4-hit combination found, stopping.")
         break
 
-print(f"\nFinal tumor matrix shape: {tumor.shape}")
+print(f"\nFinal tumor matrix shape: {tumor_gpu.shape}")
 print(f"Total loop time: {time.time() - total_start:.2f}s")
+print_result_genes(results)
