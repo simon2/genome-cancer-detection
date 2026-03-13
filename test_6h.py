@@ -68,7 +68,7 @@ def print_result_genes(results):
         print(','.join(str(g) for g in r['genes']))
 
 top_k_2h = 25000
-top_k_4h = 25000
+top_k_4h = 50000
 iteration = 0
 results = []
 total_start = time.time()
@@ -177,7 +177,7 @@ while tumor_gpu.shape[1] > 0:
         del mtx_6h_tumor, mtx_6h_normal
 
         result = find_best_valid_6h(mtx_6h, c_4h_genes, top_2h)
-        del mtx_6h
+        del mtx_6h, c_4h_tumor, c_4h_normal, c_4h_genes, c_ri, c_rj
         if result and (best_val is None or result[0] > best_val):
             best_val = result[0]
             best_genes = list(result[1:])
