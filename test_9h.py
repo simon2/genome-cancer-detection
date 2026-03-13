@@ -200,7 +200,6 @@ while tumor_gpu.shape[1] > 0:
     best_genes = None
 
     chunk_4h_tumor_list = []
-    chunk_4h_normal_list = []
     chunk_4h_genes_list = []
 
     boundary_4h = 0
@@ -247,7 +246,6 @@ while tumor_gpu.shape[1] > 0:
                 new_8h_genes.append(genes)
 
         chunk_4h_tumor_list.append(c_4h_tumor)
-        chunk_4h_normal_list.append(c_4h_normal)
         chunk_4h_genes_list.append(c_4h_genes)
 
         n_new = sum(len(t) for t in new_8h_tp)
@@ -321,7 +319,7 @@ while tumor_gpu.shape[1] > 0:
 
         n_chunk_4 += 1
 
-    del chunk_4h_tumor_list, chunk_4h_normal_list, chunk_4h_genes_list
+    del chunk_4h_tumor_list, chunk_4h_genes_list
     del sorted_4h_tp, sorted_4h_ri, sorted_4h_rj, sorted_4h_genes
     del data_2h_tumor, data_2h_normal
 
