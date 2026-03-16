@@ -101,7 +101,7 @@ def find_best_valid_9h(mtx_9h, genes_8h):
     return (max_val, *genes_out)
 
 
-tumor, normal = read_data('data/PCPG.txt')
+tumor, normal = read_data('data/ACC.txt')
 print(f"Tumor matrix shape:     {tumor.shape}")
 print(f"Non-tumor matrix shape: {normal.shape}")
 
