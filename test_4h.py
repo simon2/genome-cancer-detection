@@ -47,7 +47,7 @@ def find_best_valid_4h(mtx_4h, chunk_a_indices, chunk_b_indices, cross):
     if not cp.any(valid):
         return None
 
-    mtx_masked = cp.where(valid, mtx_4h, cp.iinfo(mtx_4h.dtype).min)
+    mtx_masked = cp.where(valid, mtx_4h, cp.finfo(mtx_4h.dtype).min)
     flat_idx = int(cp.argmax(mtx_masked))
     p = flat_idx // n_b
     q = flat_idx % n_b
@@ -76,8 +76,8 @@ top_k = 10000
 iteration = 0
 results = []
 
-tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
-normal_gpu = cp.asarray(normal, dtype=cp.int16)
+tumor_gpu = cp.asarray(tumor, dtype=cp.float16)
+normal_gpu = cp.asarray(normal, dtype=cp.float16)
 
 total_start = time.time()
 
@@ -161,9 +161,9 @@ while tumor_gpu.shape[1] > 0:
 
     if best_genes is not None:
         idx_a, idx_b, idx_c, idx_d = best_genes
-        mask_tumor = (tumor_gpu[idx_a] & tumor_gpu[idx_b] & tumor_gpu[idx_c] & tumor_gpu[idx_d]).astype(bool)
+        mask_tumor = (tumor_gpu[idx_a] * tumor_gpu[idx_b] * tumor_gpu[idx_c] * tumor_gpu[idx_d]).astype(bool)
         removed = cp.sum(mask_tumor)
-        mask_normal = (normal_gpu[idx_a] & normal_gpu[idx_b] & normal_gpu[idx_c] & normal_gpu[idx_d]).astype(bool)
+        mask_normal = (normal_gpu[idx_a] * normal_gpu[idx_b] * normal_gpu[idx_c] * normal_gpu[idx_d]).astype(bool)
         covered = cp.sum(mask_normal)
         if removed == 0:
             print(f"No tumors removed with genes {idx_a},{idx_b},{idx_c},{idx_d}, stopping.")

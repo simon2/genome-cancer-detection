@@ -89,7 +89,7 @@ def find_best_valid_9h(mtx_9h, genes_8h):
     if not cp.any(valid):
         return None
 
-    mtx_masked = cp.where(valid, mtx_9h, cp.iinfo(mtx_9h.dtype).min)
+    mtx_masked = cp.where(valid, mtx_9h, cp.finfo(mtx_9h.dtype).min)
     del valid
     flat_idx = int(cp.argmax(mtx_masked))
     del mtx_masked
@@ -123,8 +123,8 @@ top_k_8h = 10000
 iteration = 0
 results = []
 
-tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
-normal_gpu = cp.asarray(normal, dtype=cp.int16)
+tumor_gpu = cp.asarray(tumor, dtype=cp.float16)
+normal_gpu = cp.asarray(normal, dtype=cp.float16)
 
 total_start = time.time()
 
@@ -333,12 +333,12 @@ while tumor_gpu.shape[1] > 0:
     if best_genes is not None:
         mask = tumor_gpu[best_genes[0]].astype(bool)
         for k in range(1, 9):
-            mask &= tumor_gpu[best_genes[k]].astype(bool)
+            mask *= tumor_gpu[best_genes[k]].astype(bool)
         removed = int(cp.sum(mask))
 
         mask_normal = normal_gpu[best_genes[0]].astype(bool)
         for k in range(1, 9):
-            mask_normal &= normal_gpu[best_genes[k]].astype(bool)
+            mask_normal *= normal_gpu[best_genes[k]].astype(bool)
         covered_normals = int(cp.sum(mask_normal))
 
         if removed == 0:
