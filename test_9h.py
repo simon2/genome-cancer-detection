@@ -122,10 +122,11 @@ top_k_4h = 25000
 top_k_8h = 10000
 iteration = 0
 results = []
-total_start = time.time()
 
 tumor_gpu = cp.asarray(tumor, dtype=cp.int16)
 normal_gpu = cp.asarray(normal, dtype=cp.int16)
+
+total_start = time.time()
 
 while tumor_gpu.shape[1] > 0:
     iteration += 1
