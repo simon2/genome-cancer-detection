@@ -22,36 +22,32 @@ def read_data(filepath):
     return tumor_matrix, non_tumor_matrix
 
 
-def find_best_valid_8h(mtx_8h, genes_4h_a, genes_4h_b, cross):
-    """Find best valid 8-hit combo from score matrix.
-    mtx_8h: (n_a, n_b) score matrix on GPU
-    genes_4h_a: (n_a, 4) gene indices on GPU (row side)
-    genes_4h_b: (n_b, 4) gene indices on GPU (col side)
-    cross: if False, matrix is symmetric -> upper triangle only
-    Returns (max_val, g1..g8) or None.
+def find_best_valid_5h(mtx_5h, genes_4h, n_genes):
+    """Find best valid 5-hit combo from score matrix.
+    mtx_5h: (n_4h, n_genes) score matrix on GPU, NOT symmetric
+    genes_4h: (n_4h, 4) gene indices on GPU (row side)
+    n_genes: total number of genes (column index = gene index)
+    Returns (max_val, g1, g2, g3, g4, g5) or None.
     """
-    n_a, n_b = mtx_8h.shape
+    n_4h, n_g = mtx_5h.shape
 
-    # Check 8 distinct genes via broadcasting (4 from row × 4 from col)
-    overlap = cp.zeros((n_a, n_b), dtype=bool)
+    # Check 5 distinct genes: the column index (5th gene) must not equal any of the 4 row genes
+    gene_col = cp.arange(n_g, dtype=cp.int32)[None, :]  # (1, n_genes)
+    overlap = cp.zeros((n_4h, n_g), dtype=bool)
     for k in range(4):
-        for l in range(4):
-            overlap |= (genes_4h_a[:, k:k+1] == genes_4h_b[None, :, l])
+        overlap |= (genes_4h[:, k:k+1] == gene_col)
     valid = ~overlap
-
-    if not cross:
-        valid = cp.triu(valid, k=1)
 
     if not cp.any(valid):
         return None
 
-    mtx_masked = cp.where(valid, mtx_8h, cp.finfo(mtx_8h.dtype).min)
+    mtx_masked = cp.where(valid, mtx_5h, cp.finfo(mtx_5h.dtype).min)
     flat_idx = int(cp.argmax(mtx_masked))
-    p = flat_idx // n_b
-    q = flat_idx % n_b
-    max_val = int(mtx_8h[p, q])
+    p = flat_idx // n_g
+    q = flat_idx % n_g
+    max_val = int(mtx_5h[p, q])
 
-    genes_out = list(cp.asnumpy(genes_4h_a[p])) + list(cp.asnumpy(genes_4h_b[q]))
+    genes_out = list(cp.asnumpy(genes_4h[p])) + [q]
     return (max_val, *genes_out)
 
 
@@ -66,7 +62,7 @@ def run(data_file):
     print(f"Non-tumor matrix shape: {normal.shape}")
 
     top_k_2h = 25000
-    top_k_4h = 25000
+    top_k_4h = 50000
     iteration = 0
     results = []
 
@@ -95,17 +91,16 @@ def run(data_file):
 
         print(f"max 2-hit TP: {sorted_2h_vals[0]}, boundary_2h: {boundary_2h}")
 
-        top_2h = sorted_2h_indices[:actual_2h]  # (actual_2h, 2) gene indices
+        top_2h = sorted_2h_indices[:actual_2h]
 
         # Build 2-hit data matrices
-        data_2h_tumor = tumor_gpu[top_2h[:, 0]] * tumor_gpu[top_2h[:, 1]]  # (top_k_2h, n_tumor)
-        data_2h_normal = normal_gpu[top_2h[:, 0]] * normal_gpu[top_2h[:, 1]]  # (top_k_2h, n_normal)
+        data_2h_tumor = tumor_gpu[top_2h[:, 0]] * tumor_gpu[top_2h[:, 1]]
+        data_2h_normal = normal_gpu[top_2h[:, 0]] * normal_gpu[top_2h[:, 1]]
 
-        # Free 2-hit sorting arrays
         del i_idx, j_idx, upper_2h, sort_2h, sorted_2h_vals, sorted_2h_indices
 
         # === Step 2: 4-hit from 2-hit top-k ===
-        mtx_4h_tp = data_2h_tumor @ data_2h_tumor.T  # (top_k_2h, top_k_2h)
+        mtx_4h_tp = data_2h_tumor @ data_2h_tumor.T
         ri_4h, rj_4h = cp.triu_indices(actual_2h, k=1)
         upper_4h = mtx_4h_tp[ri_4h, rj_4h]
         del mtx_4h_tp
@@ -130,30 +125,24 @@ def run(data_file):
             print("No valid 4-hit entries, stopping.")
             break
 
-        # Take only valid entries (first n_valid_4h after descending sort)
         sorted_4h_pos = sort_4h[:n_valid_4h]
         del sort_4h
         sorted_4h_tp = upper_4h[sorted_4h_pos]
-        sorted_4h_ri = ri_4h[sorted_4h_pos]  # indices into top_2h
+        sorted_4h_ri = ri_4h[sorted_4h_pos]
         sorted_4h_rj = rj_4h[sorted_4h_pos]
         del ri_4h, rj_4h, upper_4h, sorted_4h_pos
 
-        # Gene indices for sorted 4-hit entries
         sorted_4h_genes = cp.stack([
             top_2h[sorted_4h_ri, 0], top_2h[sorted_4h_ri, 1],
             top_2h[sorted_4h_rj, 0], top_2h[sorted_4h_rj, 1]
-        ], axis=1)  # (n_valid_4h, 4)
+        ], axis=1)
 
         print(f"Valid 4-hit entries: {n_valid_4h}, max 4-hit TP: {sorted_4h_tp[0]}")
 
-        # === Step 3: 8-hit with chunked 4-hit expansion ===
+        # === Step 3: 5-hit with chunked 4-hit expansion ===
+        # 5-hit = 4-hit chunk × all original genes (not symmetric, column side is fixed)
         best_val = None
         best_genes = None
-
-        # Store chunk data for cross-chunk computation
-        chunk_4h_tumor_list = []
-        chunk_4h_normal_list = []
-        chunk_4h_genes_list = []
 
         n_chunk = 0
         while True:
@@ -169,38 +158,21 @@ def run(data_file):
             # Build 4-hit data for this chunk
             c_ri = sorted_4h_ri[cs:ce]
             c_rj = sorted_4h_rj[cs:ce]
-            c_4h_tumor = data_2h_tumor[c_ri] * data_2h_tumor[c_rj]  # (chunk_size, n_tumor)
-            c_4h_normal = data_2h_normal[c_ri] * data_2h_normal[c_rj]  # (chunk_size, n_normal)
-            c_4h_genes = sorted_4h_genes[cs:ce]  # (chunk_size, 4)
+            c_4h_tumor = data_2h_tumor[c_ri] * data_2h_tumor[c_rj]
+            c_4h_normal = data_2h_normal[c_ri] * data_2h_normal[c_rj]
+            c_4h_genes = sorted_4h_genes[cs:ce]
 
-            chunk_4h_tumor_list.append(c_4h_tumor)
-            chunk_4h_normal_list.append(c_4h_normal)
-            chunk_4h_genes_list.append(c_4h_genes)
+            # 5-hit score matrix: 4-hit chunk × all genes (not symmetric)
+            mtx_5h_tumor = c_4h_tumor @ tumor_gpu.T  # (chunk_size, n_genes)
+            mtx_5h_normal = c_4h_normal @ normal_gpu.T
+            mtx_5h = mtx_5h_tumor - 10 * mtx_5h_normal
+            del mtx_5h_tumor, mtx_5h_normal
 
-            # Self: chunk × chunk (symmetric, upper triangle)
-            mtx_8h_tumor = c_4h_tumor @ c_4h_tumor.T
-            mtx_8h_normal = c_4h_normal @ c_4h_normal.T
-            mtx_8h = mtx_8h_tumor - 10 * mtx_8h_normal
-            del mtx_8h_tumor, mtx_8h_normal
-
-            result = find_best_valid_8h(mtx_8h, c_4h_genes, c_4h_genes, cross=False)
-            del mtx_8h
+            result = find_best_valid_5h(mtx_5h, c_4h_genes, tumor_gpu.shape[0])
+            del mtx_5h, c_4h_tumor, c_4h_normal, c_4h_genes, c_ri, c_rj
             if result and (best_val is None or result[0] > best_val):
                 best_val = result[0]
                 best_genes = list(result[1:])
-
-            # Cross: previous chunks × this chunk (not symmetric)
-            for prev_idx in range(n_chunk):
-                mtx_8h_tumor = chunk_4h_tumor_list[prev_idx] @ c_4h_tumor.T
-                mtx_8h_normal = chunk_4h_normal_list[prev_idx] @ c_4h_normal.T
-                mtx_8h = mtx_8h_tumor - 10 * mtx_8h_normal
-                del mtx_8h_tumor, mtx_8h_normal
-
-                result = find_best_valid_8h(mtx_8h, chunk_4h_genes_list[prev_idx], c_4h_genes, cross=True)
-                del mtx_8h
-                if result and (best_val is None or result[0] > best_val):
-                    best_val = result[0]
-                    best_genes = list(result[1:])
 
             print(f"  4h-chunk {n_chunk}: [{cs}:{ce}], boundary_4h={boundary_4h}, best_val={best_val}")
 
@@ -217,20 +189,17 @@ def run(data_file):
         elif best_val is not None:
             print(f"  WARNING: best_val ({best_val}) < boundary_2h ({boundary_2h}), may need 2-hit expansion.")
 
-        # Clean up
+        # Clean up 4-hit arrays
         del sorted_4h_tp, sorted_4h_ri, sorted_4h_rj, sorted_4h_genes
         del data_2h_tumor, data_2h_normal
-        del chunk_4h_tumor_list, chunk_4h_normal_list, chunk_4h_genes_list
 
         if best_genes is not None:
-            idx_a, idx_b, idx_c, idx_d, idx_e, idx_f, idx_g, idx_h = best_genes
+            idx_a, idx_b, idx_c, idx_d, idx_e = best_genes
             mask = (tumor_gpu[idx_a] * tumor_gpu[idx_b] * tumor_gpu[idx_c] *
-                    tumor_gpu[idx_d] * tumor_gpu[idx_e] * tumor_gpu[idx_f] *
-                    tumor_gpu[idx_g] * tumor_gpu[idx_h]).astype(bool)
+                    tumor_gpu[idx_d] * tumor_gpu[idx_e]).astype(bool)
             removed = int(cp.sum(mask))
             mask_normal = (normal_gpu[idx_a] * normal_gpu[idx_b] * normal_gpu[idx_c] *
-                           normal_gpu[idx_d] * normal_gpu[idx_e] * normal_gpu[idx_f] *
-                           normal_gpu[idx_g] * normal_gpu[idx_h]).astype(bool)
+                           normal_gpu[idx_d] * normal_gpu[idx_e]).astype(bool)
             covered_normals = int(cp.sum(mask_normal))
             if removed == 0:
                 print(f"No tumors removed with genes {best_genes}, stopping.")
@@ -245,7 +214,7 @@ def run(data_file):
             })
             tumor_gpu = tumor_gpu[:, ~mask]
         else:
-            print("No valid 8-hit combination found, stopping.")
+            print("No valid 5-hit combination found, stopping.")
             break
 
     print(f"\nFinal tumor matrix shape: {tumor_gpu.shape}")
@@ -254,4 +223,4 @@ def run(data_file):
     return results
 
 if __name__ == '__main__':
-    run('data/KIRP.txt')
+    run('data/BLCA.txt')

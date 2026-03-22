@@ -22,26 +22,22 @@ def read_data(filepath):
     return tumor_matrix, non_tumor_matrix
 
 
-def extract_top_valid_8h(mtx_tp, genes_a, genes_b, top_k, cross):
-    """Extract top-k valid 8-hit entries (by TP) from a TP matrix.
-    mtx_tp: (n_a, n_b) TP-only matrix on GPU
-    genes_a: (n_a, 4) gene indices on GPU (row side, 4-hit)
-    genes_b: (n_b, 4) gene indices on GPU (col side, 4-hit)
-    cross: if False, symmetric -> upper triangle only
+def extract_top_valid_6h(mtx_tp, genes_4h, genes_2h, top_k):
+    """Extract top-k valid 6-hit entries (by TP) from a TP matrix.
+    mtx_tp: (n_4h, n_2h) TP-only matrix on GPU, NOT symmetric
+    genes_4h: (n_4h, 4) gene indices on GPU (row side)
+    genes_2h: (n_2h, 2) gene indices on GPU (col side)
     Returns (tps, genes) arrays or (None, None).
     """
-    n_a, n_b = mtx_tp.shape
+    n_4h, n_2h = mtx_tp.shape
 
-    # Check 8 distinct genes (4 from row × 4 from col)
-    overlap = cp.zeros((n_a, n_b), dtype=bool)
+    # Check 6 distinct genes (4 from row × 2 from col)
+    overlap = cp.zeros((n_4h, n_2h), dtype=bool)
     for k in range(4):
-        for l in range(4):
-            overlap |= (genes_a[:, k:k+1] == genes_b[None, :, l])
+        for l in range(2):
+            overlap |= (genes_4h[:, k:k+1] == genes_2h[None, :, l])
     valid = ~overlap
     del overlap
-
-    if not cross:
-        valid = cp.triu(valid, k=1)
 
     n_valid = int(cp.sum(valid))
     if n_valid == 0:
@@ -63,41 +59,41 @@ def extract_top_valid_8h(mtx_tp, genes_a, genes_b, top_k, cross):
     if len(top_tp) == 0:
         return None, None
 
-    rows = top_flat_idx // n_b
-    cols = top_flat_idx % n_b
-    top_genes = cp.concatenate([genes_a[rows], genes_b[cols]], axis=1)  # (k, 8)
+    rows = top_flat_idx // n_2h
+    cols = top_flat_idx % n_2h
+    top_genes = cp.concatenate([genes_4h[rows], genes_2h[cols]], axis=1)  # (k, 6)
     return top_tp, top_genes
 
 
-def find_best_valid_9h(mtx_9h, genes_8h):
-    """Find best valid 9-hit combo from score matrix.
-    mtx_9h: (n_8h, n_genes) score matrix on GPU
-    genes_8h: (n_8h, 8) gene indices on GPU (row side)
+def find_best_valid_7h(mtx_7h, genes_6h):
+    """Find best valid 7-hit combo from score matrix.
+    mtx_7h: (n_6h, n_genes) score matrix on GPU
+    genes_6h: (n_6h, 6) gene indices on GPU (row side)
     Column index j = gene index j.
-    Returns (max_val, g1..g9) or None.
+    Returns (max_val, g1..g7) or None.
     """
-    n_8h, n_genes = mtx_9h.shape
+    n_6h, n_genes = mtx_7h.shape
 
-    # Check that the 9th gene (column) is not in the 8 genes (row)
-    gene_col = cp.arange(n_genes, dtype=genes_8h.dtype)
-    overlap = cp.zeros((n_8h, n_genes), dtype=bool)
-    for k in range(8):
-        overlap |= (genes_8h[:, k:k+1] == gene_col[None, :])
+    # Check that the 7th gene (column) is not in the 6 genes (row)
+    gene_col = cp.arange(n_genes, dtype=cp.int32)
+    overlap = cp.zeros((n_6h, n_genes), dtype=bool)
+    for k in range(6):
+        overlap |= (genes_6h[:, k:k+1] == gene_col[None, :])
     valid = ~overlap
     del overlap
 
     if not cp.any(valid):
         return None
 
-    mtx_masked = cp.where(valid, mtx_9h, cp.finfo(mtx_9h.dtype).min)
+    mtx_masked = cp.where(valid, mtx_7h, cp.finfo(mtx_7h.dtype).min)
     del valid
     flat_idx = int(cp.argmax(mtx_masked))
     del mtx_masked
     p = flat_idx // n_genes
     q = flat_idx % n_genes
-    max_val = int(mtx_9h[p, q])
+    max_val = int(mtx_7h[p, q])
 
-    genes_out = list(cp.asnumpy(genes_8h[p])) + [int(q)]
+    genes_out = list(cp.asnumpy(genes_6h[p])) + [int(q)]
     return (max_val, *genes_out)
 
 
@@ -112,8 +108,8 @@ def run(data_file):
     print(f"Non-tumor matrix shape: {normal.shape}")
 
     top_k_2h = 25000
-    top_k_4h = 25000
-    top_k_8h = 10000
+    top_k_4h = 50000
+    top_k_6h = 10000
     iteration = 0
     results = []
 
@@ -190,17 +186,14 @@ def run(data_file):
 
         print(f"Valid 4-hit entries: {n_valid_4h}, max 4-hit TP: {sorted_4h_tp[0]}")
 
-        # === Step 3+4: Nested loops — outer expands 4-hit, inner searches 9-hit ===
+        # === Step 3+4: Nested loops — outer expands 4-hit, inner searches 7-hit ===
         best_val = None
         best_genes = None
-
-        chunk_4h_tumor_list = []
-        chunk_4h_genes_list = []
 
         boundary_4h = 0
         n_chunk_4 = 0
 
-        # Outer loop: expand 4-hit chunks and collect NEW 8-hit entries
+        # Outer loop: expand 4-hit chunks, collect NEW 6-hit entries, search for 7-hit
         while True:
             cs = n_chunk_4 * top_k_4h
             ce = min((n_chunk_4 + 1) * top_k_4h, n_valid_4h)
@@ -219,93 +212,74 @@ def run(data_file):
             c_4h_normal = data_2h_normal[c_ri] * data_2h_normal[c_rj]
             c_4h_genes = sorted_4h_genes[cs:ce]
 
-            # Collect NEW 8-hit entries from this chunk only
-            new_8h_tp = []
-            new_8h_genes = []
+            # Collect NEW 6-hit entries: 4-hit chunk × all 2-hit (not symmetric)
+            mtx_6h_tp = c_4h_tumor @ data_2h_tumor.T  # (chunk_size, top_k_2h)
+            tp, genes = extract_top_valid_6h(mtx_6h_tp, c_4h_genes, top_2h, top_k_6h)
+            del mtx_6h_tp
 
-            # Self: chunk × chunk (symmetric, upper triangle)
-            mtx_8h_tp = c_4h_tumor @ c_4h_tumor.T
-            tp, genes = extract_top_valid_8h(mtx_8h_tp, c_4h_genes, c_4h_genes, top_k_8h, cross=False)
-            del mtx_8h_tp
-            if tp is not None:
-                new_8h_tp.append(tp)
-                new_8h_genes.append(genes)
-
-            # Cross: previous chunks × this chunk
-            for prev_idx in range(n_chunk_4):
-                mtx_8h_tp = chunk_4h_tumor_list[prev_idx] @ c_4h_tumor.T
-                tp, genes = extract_top_valid_8h(mtx_8h_tp, chunk_4h_genes_list[prev_idx], c_4h_genes, top_k_8h, cross=True)
-                del mtx_8h_tp
-                if tp is not None:
-                    new_8h_tp.append(tp)
-                    new_8h_genes.append(genes)
-
-            chunk_4h_tumor_list.append(c_4h_tumor)
-            chunk_4h_genes_list.append(c_4h_genes)
-
-            n_new = sum(len(t) for t in new_8h_tp)
-            print(f"  4h-chunk {n_chunk_4}: [{cs}:{ce}], boundary_4h={boundary_4h}, new 8h entries={n_new}")
+            n_new = len(tp) if tp is not None else 0
+            print(f"  4h-chunk {n_chunk_4}: [{cs}:{ce}], boundary_4h={boundary_4h}, new 6h entries={n_new}")
 
             if n_new == 0:
+                del c_4h_tumor, c_4h_normal, c_4h_genes, c_ri, c_rj
                 n_chunk_4 += 1
                 continue
 
-            # Sort only the NEW 8-hit entries by TP descending
-            all_new_tp = cp.concatenate(new_8h_tp)
-            all_new_genes = cp.concatenate(new_8h_genes, axis=0)
-            sort_new = cp.argsort(all_new_tp)[::-1]
-            actual_new = min(top_k_8h, len(all_new_tp))
-            sorted_new_tp = all_new_tp[sort_new[:actual_new]]
-            sorted_new_genes = all_new_genes[sort_new[:actual_new]]
-            del all_new_tp, all_new_genes, sort_new, new_8h_tp, new_8h_genes
+            # Sort NEW 6-hit entries by TP descending
+            sort_new = cp.argsort(tp)[::-1]
+            actual_new = min(top_k_6h, len(tp))
+            sorted_new_tp = tp[sort_new[:actual_new]]
+            sorted_new_genes = genes[sort_new[:actual_new]]
+            del tp, genes, sort_new
 
-            print(f"  New 8-hit entries sorted: {actual_new}, max 8-hit TP: {sorted_new_tp[0]}")
+            print(f"  New 6-hit entries sorted: {actual_new}, max 6-hit TP: {sorted_new_tp[0]}")
 
-            # Inner loop: chunk through NEW 8-hit entries to find best 9-hit
-            n_chunk_9 = 0
+            # Inner loop: chunk through NEW 6-hit entries to find best 7-hit
+            n_chunk_6 = 0
             while True:
-                cs9 = n_chunk_9 * top_k_8h
-                ce9 = min((n_chunk_9 + 1) * top_k_8h, actual_new)
+                cs6 = n_chunk_6 * top_k_6h
+                ce6 = min((n_chunk_6 + 1) * top_k_6h, actual_new)
 
-                if cs9 >= actual_new:
-                    print("    New 8-hit entries exhausted.")
+                if cs6 >= actual_new:
+                    print("    New 6-hit entries exhausted.")
                     break
 
-                boundary_8h = int(sorted_new_tp[ce9]) if ce9 < actual_new else 0
+                boundary_6h = int(sorted_new_tp[ce6]) if ce6 < actual_new else 0
 
-                # Build 8-hit data for this chunk from gene indices
-                c_8h_genes = sorted_new_genes[cs9:ce9]
-                chunk_size = ce9 - cs9
+                # Build 6-hit data for this chunk from gene indices
+                c_6h_genes = sorted_new_genes[cs6:ce6]
+                chunk_size = ce6 - cs6
 
-                c_8h_tumor = cp.ones((chunk_size, tumor_gpu.shape[1]), dtype=cp.float16)
-                for k in range(8):
-                    c_8h_tumor *= tumor_gpu[c_8h_genes[:, k]]
-                c_8h_normal = cp.ones((chunk_size, normal_gpu.shape[1]), dtype=cp.float16)
-                for k in range(8):
-                    c_8h_normal *= normal_gpu[c_8h_genes[:, k]]
+                c_6h_tumor = cp.ones((chunk_size, tumor_gpu.shape[1]), dtype=cp.float16)
+                for k in range(6):
+                    c_6h_tumor *= tumor_gpu[c_6h_genes[:, k]]
+                c_6h_normal = cp.ones((chunk_size, normal_gpu.shape[1]), dtype=cp.float16)
+                for k in range(6):
+                    c_6h_normal *= normal_gpu[c_6h_genes[:, k]]
 
-                # 9-hit score matrix: 8-hit chunk × all genes (not symmetric)
-                mtx_9h_tumor = c_8h_tumor @ tumor_gpu.T
-                mtx_9h_normal = c_8h_normal @ normal_gpu.T
-                mtx_9h = mtx_9h_tumor - 10 * mtx_9h_normal
-                del mtx_9h_tumor, mtx_9h_normal, c_8h_tumor, c_8h_normal
+                # 7-hit score matrix: 6-hit chunk × all genes (not symmetric)
+                mtx_7h_tumor = c_6h_tumor @ tumor_gpu.T
+                mtx_7h_normal = c_6h_normal @ normal_gpu.T
+                mtx_7h = mtx_7h_tumor - 10 * mtx_7h_normal
+                del mtx_7h_tumor, mtx_7h_normal, c_6h_tumor, c_6h_normal
 
-                result = find_best_valid_9h(mtx_9h, c_8h_genes)
-                del mtx_9h
+                result = find_best_valid_7h(mtx_7h, c_6h_genes)
+                del mtx_7h
                 if result and (best_val is None or result[0] > best_val):
                     best_val = result[0]
                     best_genes = list(result[1:])
 
-                print(f"    8h-chunk {n_chunk_9}: [{cs9}:{ce9}], boundary_8h={boundary_8h}, best_val={best_val}")
+                print(f"    6h-chunk {n_chunk_6}: [{cs6}:{ce6}], boundary_6h={boundary_6h}, best_val={best_val}")
 
-                # Inner stopping: remaining new 8-hit entries can't improve
-                if best_val is not None and boundary_8h <= best_val:
-                    print(f"    8-hit expansion done (boundary_8h={boundary_8h} <= best_val={best_val}).")
+                # Inner stopping: remaining new 6-hit entries can't improve
+                if best_val is not None and boundary_6h <= best_val:
+                    print(f"    6-hit expansion done (boundary_6h={boundary_6h} <= best_val={best_val}).")
                     break
 
-                n_chunk_9 += 1
+                n_chunk_6 += 1
 
             del sorted_new_tp, sorted_new_genes
+            del c_4h_tumor, c_4h_normal, c_4h_genes, c_ri, c_rj
 
             # Outer stopping: check if best_val >= boundary_4h
             if best_val is not None and boundary_4h <= best_val:
@@ -314,7 +288,6 @@ def run(data_file):
 
             n_chunk_4 += 1
 
-        del chunk_4h_tumor_list, chunk_4h_genes_list
         del sorted_4h_tp, sorted_4h_ri, sorted_4h_rj, sorted_4h_genes
         del data_2h_tumor, data_2h_normal
 
@@ -326,12 +299,12 @@ def run(data_file):
 
         if best_genes is not None:
             mask = tumor_gpu[best_genes[0]].astype(bool)
-            for k in range(1, 9):
+            for k in range(1, 7):
                 mask *= tumor_gpu[best_genes[k]].astype(bool)
             removed = int(cp.sum(mask))
 
             mask_normal = normal_gpu[best_genes[0]].astype(bool)
-            for k in range(1, 9):
+            for k in range(1, 7):
                 mask_normal *= normal_gpu[best_genes[k]].astype(bool)
             covered_normals = int(cp.sum(mask_normal))
 
@@ -348,7 +321,7 @@ def run(data_file):
             })
             tumor_gpu = tumor_gpu[:, ~mask]
         else:
-            print("No valid 9-hit combination found, stopping.")
+            print("No valid 7-hit combination found, stopping.")
             break
 
     print(f"\nFinal tumor matrix shape: {tumor_gpu.shape}")
@@ -357,4 +330,4 @@ def run(data_file):
     return results
 
 if __name__ == '__main__':
-    run('data/ACC.txt')
+    run('data/BLCA.txt')
